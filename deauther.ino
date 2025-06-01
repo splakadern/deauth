@@ -17,8 +17,8 @@
 
 // --- Global Constants and Definitions ---
 // WiFi credentials for the ESP32's SoftAP
-const char* AP_SSID = "DiabloAI_Deauther";
-const char* AP_PASSWORD = "password123"; // !!! IMPORTANT: CHANGE THIS TO A STRONG PASSWORD !!!
+const char* AP_SSID = "PLDTHOMEFIBR2473";
+const char* AP_PASSWORD = "@Suckmydickplease"; // !!! IMPORTANT: CHANGE THIS TO A STRONG PASSWORD !!!
 
 // 802.11 Frame Definitions
 #define TYPE_MANAGEMENT 0x00
