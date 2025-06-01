@@ -133,6 +133,7 @@ void sendAttackStatusToClients();
 void stringToMac(const String& macStr, uint8_t* macBytes);
 String getEncryptionType(wifi_auth_mode_t authMode);
 String getChannelBand(uint8_t channel);
+void onWiFiEvent(arduino_event_id_t event); // New: for handling WiFi events
 
 // --- Embedded Web UI HTML, CSS, and JavaScript ---
 // Minified and optimized for single file inclusion.
@@ -264,6 +265,16 @@ const char* HTML_CONTENT = R"rawstring(
             color: #FF69B4; /* Pink for inactive */
             text-shadow: 0 0 5px #FF69B4;
         }
+        #messageBox {
+            background-color: rgba(255, 0, 0, 0.8);
+            color: white;
+            padding: 10px;
+            border-radius: 8px;
+            margin-top: 10px;
+            display: none; /* Hidden by default */
+            text-align: center;
+            box-shadow: 0 0 10px rgba(255, 0, 0, 0.7);
+        }
         @media (max-width: 600px) {
             .container {
                 padding: 10px;
@@ -384,6 +395,7 @@ const char* HTML_CONTENT = R"rawstring(
                 <span class="status-label">Scanning:</span>
                 <span id="statusScanning" class="status-value inactive">Off</span>
             </div>
+            <div id="messageBox" style="display: none;"></div>
         </div>
     </div>
 
@@ -392,6 +404,7 @@ const char* HTML_CONTENT = R"rawstring(
         var scanInterval;
         var currentAPs = {};
         var currentClients = {};
+        var messageBoxTimeout;
 
         window.onload = function() {
             initWebSocket();
@@ -405,11 +418,30 @@ const char* HTML_CONTENT = R"rawstring(
             }, 1000); // Update every 1 second
         };
 
+        function showMessageBox(message, isError = false) {
+            const msgBox = document.getElementById('messageBox');
+            msgBox.textContent = message;
+            msgBox.style.display = 'block';
+            if (isError) {
+                msgBox.style.backgroundColor = 'rgba(255, 0, 0, 0.8)';
+                msgBox.style.boxShadow = '0 0 10px rgba(255, 0, 0, 0.7)';
+            } else {
+                msgBox.style.backgroundColor = 'rgba(0, 255, 0, 0.8)';
+                msgBox.style.boxShadow = '0 0 10px rgba(0, 255, 0, 0.7)';
+            }
+
+            clearTimeout(messageBoxTimeout);
+            messageBoxTimeout = setTimeout(() => {
+                msgBox.style.display = 'none';
+            }, 5000); // Hide after 5 seconds
+        }
+
         function initWebSocket() {
             ws = new WebSocket(`ws://${window.location.hostname}/ws`);
 
             ws.onopen = function() {
                 console.log('WebSocket connection opened');
+                showMessageBox('Connected to ESP32!', false);
                 // Request initial status and scan data upon connection
                 ws.send(JSON.stringify({ command: "GET_STATUS" }));
                 ws.send(JSON.stringify({ command: "GET_SCAN_DATA" }));
@@ -418,7 +450,7 @@ const char* HTML_CONTENT = R"rawstring(
             ws.onmessage = function(event) {
                 try {
                     const data = JSON.parse(event.data);
-                    console.log('Received:', data);
+                    // console.log('Received:', data); // Keep this for debugging
 
                     if (data.type === "SCAN_RESULTS") {
                         updateScanTables(data.aps, data.clients);
@@ -430,27 +462,41 @@ const char* HTML_CONTENT = R"rawstring(
                     }
                 } catch (e) {
                     console.error("Error parsing WebSocket message:", e, event.data);
+                    showMessageBox('Error receiving data from ESP32.', true);
                 }
             };
 
             ws.onclose = function() {
                 console.log('WebSocket connection closed. Reconnecting...');
+                showMessageBox('Disconnected. Reconnecting...', true);
                 setTimeout(initWebSocket, 2000); // Attempt to reconnect every 2 seconds
             };
 
             ws.onerror = function(error) {
                 console.error('WebSocket Error:', error);
+                showMessageBox('WebSocket error! Check ESP32 connection.', true);
             };
+        }
+
+        function sendCommand(commandObj) {
+            if (ws.readyState === WebSocket.OPEN) {
+                const message = JSON.stringify(commandObj);
+                console.log('Sending:', message); // Log before sending
+                ws.send(message);
+            } else {
+                console.error('WebSocket not open. Cannot send command:', commandObj);
+                showMessageBox('Not connected to ESP32. Please refresh or check Wi-Fi.', true);
+            }
         }
 
         function setupEventListeners() {
             document.getElementById('startScanBtn').addEventListener('click', function() {
-                ws.send(JSON.stringify({ command: "START_SCAN" }));
+                sendCommand({ command: "START_SCAN" });
                 // UI update for scanning status is handled by the server's ATTACK_STATUS message
             });
 
             document.getElementById('stopScanBtn').addEventListener('click', function() {
-                ws.send(JSON.stringify({ command: "STOP_SCAN" }));
+                sendCommand({ command: "STOP_SCAN" });
                 // UI update for scanning status is handled by the server's ATTACK_STATUS message
             });
 
@@ -459,12 +505,15 @@ const char* HTML_CONTENT = R"rawstring(
                 const targetValue = document.getElementById('targetSelect').value;
                 const channel = document.getElementById('channelSelect').value;
 
-                if (attackType === "0" || !targetValue) {
-                    // Using a simple alert for immediate user feedback as per previous code,
-                    // but a custom modal would be better in a production app.
-                    alert("Please select an attack type and a target.");
+                if (attackType === "0") {
+                    showMessageBox("Please select an attack type.", true);
                     return;
                 }
+                if (!targetValue) {
+                    showMessageBox("Please select a target (AP, Client, or All Nearby).", true);
+                    return;
+                }
+
 
                 let targetMac = "";
                 let targetApBssid = "";
@@ -489,7 +538,7 @@ const char* HTML_CONTENT = R"rawstring(
                         }
                     }
                     if (!targetApBssid || targetApBssid === "00:00:00:00:00:00") {
-                        alert("Could not determine associated AP for the selected client. Please select an AP or 'All Nearby'.");
+                        showMessageBox("Could not determine associated AP for the selected client. Please select an AP or 'All Nearby'.", true);
                         return;
                     }
                 }
@@ -502,11 +551,11 @@ const char* HTML_CONTENT = R"rawstring(
                     channel: parseInt(channel),
                     channelHopping: isChannelHopping
                 };
-                ws.send(JSON.stringify(command));
+                sendCommand(command);
             });
 
             document.getElementById('stopAttackBtn').addEventListener('click', function() {
-                ws.send(JSON.stringify({ command: "STOP_ATTACK" }));
+                sendCommand({ command: "STOP_ATTACK" });
             });
         }
 
@@ -633,6 +682,9 @@ void setup() {
     xScanDataMutex = xSemaphoreCreateMutex();
     xAttackControlMutex = xSemaphoreCreateMutex();
 
+    // Register WiFi event handler for scan completion
+    WiFi.onEvent(onWiFiEvent);
+
     setupWiFi();
     setupWebServer();
     setupWebSocket();
@@ -718,8 +770,6 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
         // Ensure data is null-terminated for String conversion and JSON parsing
         // Using a fixed-size buffer on stack for small messages for speed,
         // or dynamic allocation for larger ones if needed.
-        // For simplicity and to avoid malloc/free overhead in a tight loop,
-        // we'll use a reasonably sized stack buffer.
         char msg_buf[1024]; // Max 1KB message
         if (len >= sizeof(msg_buf)) {
             Serial.println("[DiabloAI] WS message too large for buffer, skipping.");
@@ -829,7 +879,10 @@ void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
                 ap.lastSeen = millis();
 
                 // Extract SSID from Information Elements (IEs)
-                uint8_t* current_ie = ipkt->payload + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint16_t); // Skip fixed management frame header (Capability Info, Listen Interval, etc.)
+                // Skip fixed management frame header (Capability Info, Listen Interval, etc.)
+                // This offset might vary slightly based on specific frame types/subtypes.
+                // For a robust parser, one would iterate through all IEs.
+                uint8_t* current_ie = ipkt->payload + (subtype == 0x08 ? 12 : 0); // Beacon fixed header size (12 bytes)
                 size_t remaining_payload_len = pkt->rx_ctrl.sig_len - sizeof(wifi_ieee80211_mac_hdr_t) - (current_ie - ipkt->payload);
                 ap.ssid = "<hidden>"; // Default for hidden SSIDs or if not found
 
@@ -838,8 +891,13 @@ void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
                     uint8_t element_id = current_ie[0];
                     uint8_t element_len = current_ie[1];
 
+                    // Ensure element_len doesn't cause read beyond buffer
+                    if (element_len > remaining_payload_len - 2) {
+                        break; // Malformed IE, break to prevent crash
+                    }
+
                     if (element_id == 0x00) { // SSID Element ID
-                        if (element_len > 0 && (remaining_payload_len >= (2 + element_len))) {
+                        if (element_len > 0) {
                             ap.ssid = String((char*)(current_ie + 2), element_len);
                         } else {
                             ap.ssid = "<hidden>"; // SSID length is 0 for hidden networks
@@ -1225,5 +1283,47 @@ String getChannelBand(uint8_t channel) {
         return "2.4GHz";
     }
     return "Unknown";
+}
+
+// --- New: WiFi Event Handler ---
+void onWiFiEvent(arduino_event_id_t event) {
+    switch (event) {
+        case ARDUINO_EVENT_WIFI_AP_START:
+            Serial.println("[DiabloAI] WiFi AP Started.");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STOP:
+            Serial.println("[DiabloAI] WiFi AP Stopped.");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+            Serial.println("[DiabloAI] Client connected to AP.");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+            Serial.println("[DiabloAI] Client disconnected from AP.");
+            break;
+        case ARDUINO_EVENT_WIFI_SCAN_DONE:
+            Serial.println("[DiabloAI] WiFi Scan Done.");
+            // After scan completes, update UI
+            if (xSemaphoreTake(xScanDataMutex, portMAX_DELAY) == pdTRUE) {
+                isScanning = false; // Scan is no longer active
+                xSemaphoreGive(xScanDataMutex);
+            }
+            sendScanResultsToClients(); // Send latest scan data
+            sendAttackStatusToClients(); // Update scanning status in UI
+            break;
+        case ARDUINO_EVENT_WIFI_STA_START:
+            Serial.println("[DiabloAI] WiFi STA Started.");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_STOP:
+            Serial.println("[DiabloAI] WiFi STA Stopped.");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            Serial.println("[DiabloAI] WiFi STA Got IP.");
+            // This event is useful if you were connecting to an external AP,
+            // but for SoftAP mode, the IP is already known.
+            break;
+        default:
+            // Serial.printf("[DiabloAI] Unhandled WiFi Event: %d\n", event); // Uncomment for all events
+            break;
+    }
 }
 
