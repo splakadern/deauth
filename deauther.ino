@@ -12,8 +12,8 @@
 extern "C" esp_err_t esp_wifi_80211_tx(wifi_interface_t ifx, const void *buffer, int len, bool en_sys_seq);
 
 // --- Configuration ---
-const char* AP_SSID = "DiabloAI_Control"; // SSID for the ESP32's control panel
-const char* AP_PASSWORD = "unboundpower"; // Password for the control panel
+const char* AP_SSID = "PLDTHOMEFIBR8266"; // SSID for the ESP32's control panel
+const char* AP_PASSWORD = "@Suckmydick"; // Password for the control panel
 const int AP_CHANNEL = 6; // Fixed channel for the control AP
 
 // --- 802.11 Frame Structures ---
